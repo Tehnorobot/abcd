@@ -5,6 +5,8 @@ python run_inference.py
 ```
 
 # Важное
+Создайте в корне папку weights.
+
 В `weights` нужно будет добавить вес модели ([скачать тут](https://drive.google.com/drive/folders/1zMowuO5pJApjnrcT5XkYHPAY4LYVtJvs?usp=sharing))
 
 # Полезное
