@@ -5,9 +5,11 @@ python run_inference.py
 ```
 
 # Важное
-Создайте в корне папку weights.
+Создайте в корне папки weights и stats.
 
 В `weights` нужно будет добавить вес модели ([скачать тут](https://drive.google.com/drive/folders/1zMowuO5pJApjnrcT5XkYHPAY4LYVtJvs?usp=sharing))
+
+В `stats` нужно будет добавить stats.npz ([скачать тут](https://drive.google.com/drive/folders/1zMowuO5pJApjnrcT5XkYHPAY4LYVtJvs?usp=sharing))
 
 # Полезное
 На выходе будет xlsx-файл (xlsx_bytes) в формате base64. Читать его так:

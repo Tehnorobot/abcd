@@ -37,7 +37,10 @@ MODELS = [
         ("covid19",      r"./weights/model"),
         ("aneurysm_TAA", r"./weights/model"),
         ("pleural_eff",  r"./weights/model"),
+        ("medDINOv3", r"./weights/model_meddinov3.pth")
     ]
+
+STATS = "./stats/stats.npz"
 
 RECOMMENDED_PROFILES = {
     "fast_debug": {
@@ -891,10 +894,33 @@ class ModelAdapter:
             "meta": meta
         }
 
+class OneClassAnomalyLoader:
+    def __init__(self, stats_file: str):
+        data = np.load(stats_file)
+        self.mu = data["mu"]
+        self.Sigma_inv = data["Sigma_inv"]
+        self.threshold_q = float(data["threshold_q"])
+        self.tau = float(data["tau"])
+        self.topk_frac = float(data["topk_frac"])
+        self.kmin = int(data["kmin"])
+
+    def score_patient(self, fmaps: torch.Tensor) -> dict:
+        H = fmaps.mean(dim=[2,3]).cpu().numpy()  # [Z,D]
+        diff = H - self.mu[None,:]
+        d2 = np.einsum('zd,dd,zd->z', diff, self.Sigma_inv, diff)
+        d = np.sqrt(np.clip(d2, 0.0, None))
+        S = _topk_mean(d, frac=self.topk_frac, k_min=self.kmin)
+        x = (S - self.threshold_q) / max(1e-6, self.tau)
+        prob = float(1 / (1 + np.exp(-x)))
+        return {"prob_anomaly": prob, "score": S, "slice_scores": d.tolist()}
+
+
 class ModelZoo:
     def __init__(self, models: List[Tuple[str, str]], device="cuda", profile="balanced"):
         self.adapters = {name: ModelAdapter(device=device, ckpt_path=ckpt, profile=profile)
                          for name, ckpt in models}
+        
+        self.anom = OneClassAnomalyLoader(stats_file=STATS)
 
     def infer_one_patient_row(self, dicom_dir: str, thr: float = 0.5) -> Dict[str, Any]:
         """
@@ -906,15 +932,98 @@ class ModelZoo:
         per_model: Dict[str, Dict[str, Any]] = {}
         status = "Success"
         last_error = None
+        anom_cols = {}
 
+    
         try:
             for name, adapter in self.adapters.items():
+                if name == 'medDINOv3':
+                    try:
+                        logits, w, fmaps, slices_for_vis, meta = adapter.trainer._forward_patient_with_maps(dicom_dir)
+                        an = self.anom.score_patient(fmaps)
+
+                        anom_cols["probability_of_anomaly"] = float(an["prob_anomaly"])
+                        anom_cols["pred@anomaly"] = int(an["prob_anomaly"] >= 0.5)
+                        anom_cols["anom_score"] = float(an["score"])
+
+                        s = np.asarray(an["slice_scores"], dtype=np.float32)
+                        s = (s - s.min()) / (s.max() - s.min() + 1e-6)
+
+                        Z, D, h, w = fmaps.shape
+                        heats = []
+                        for z in range(Z):
+                            f = fmaps[z].detach().cpu().numpy()         # [D,h,w]
+                            heat = np.sqrt((f**2).sum(axis=0))          # [h,w]
+                            hmin, hmax = heat.min(), heat.max()
+                            if hmax > hmin:
+                                heat = (heat - hmin) / (hmax - hmin)
+                            heats.append(heat * float(s[z]))
+                        cam_small = np.stack(heats, axis=0)             # [Z,h,w]
+
+                        # апскейл до [Z,H,W] если есть реф. срезы
+                        mask_soft = cam_small
+                        if len(slices_for_vis) > 0:
+                            import cv2
+                            H0, W0 = slices_for_vis[0].shape
+                            mask_soft = np.zeros((Z, H0, W0), np.float32)
+                            for z in range(Z):
+                                mask_soft[z] = cv2.resize(cam_small[z], (W0, H0), interpolation=cv2.INTER_CUBIC)
+                            mmin, mmax = mask_soft.min(), mask_soft.max()
+                            if mmax > mmin:
+                                mask_soft = (mask_soft - mmin) / (mmax - mmin)
+
+                        # bbox (воксели и мм)
+                        bbox, bbox_mm = robust_bbox_from_soft_mask(
+                            mask_soft,
+                            spacing_xyz=meta.get("spacing", None),
+                            thr=None,
+                            mode="percentile",
+                            pctl=99.0,
+                            k_std=0.5,
+                            smooth_sigma=1.0,
+                            min_voxels=200,
+                            ensure_nonempty=True
+                        )
+
+                        spacing_mm = None
+                        try:
+                            series = collect_series(dicom_dir)
+                            any_uid = next(iter(series))
+                            some_ds = series[any_uid][0][1]
+                            sx = float(getattr(some_ds, "PixelSpacing", [1.0,1.0])[0])
+                            sy = float(getattr(some_ds, "PixelSpacing", [1.0,1.0])[1])
+                            sz = float(getattr(some_ds, "SliceThickness", 1.0))
+                            spacing_mm = (sx, sy, sz)
+                        except Exception:
+                            pass
+
+                        meta_mask = {
+                            "study_uid": study_uid,
+                            "series_uid": series_uid,
+                            "spacing_mm": spacing_mm,
+                        }
+                        mask_b64 = _pack_mask_b64(mask_soft, meta_mask)
+
+                        anom_cols["mask_b64@anomaly"] = mask_b64
+                        if bbox is not None:
+                            anom_cols["bbox_vox@anomaly"] = json.dumps([float(x) for x in bbox])
+                        if bbox_mm is not None:
+                            anom_cols["bbox_mm@anomaly"] = json.dumps([float(x) for x in bbox_mm])
+                    except:
+                        pass
+                    finally:
+                        continue
+
+
+
                 res = adapter.infer_study(dicom_dir)
                 prob = float(res.get("prob", 0.0))
                 attn = res.get("attn_weights", None)
                 cam3d = res.get("cam_3d", None)
                 slices_gray = res.get("slices_gray", None)
                 meta = res.get('meta', {})
+
+                
 
                 # fallback для attn, если не пришёл
                 if attn is None:
@@ -1006,6 +1115,9 @@ class ModelZoo:
                 row[f"bbox_vox@{name}"] = json.dumps([float(x) for x in info["bbox"]])
             if info["bbox_mm"] is not None:
                 row[f"bbox_mm@{name}"] = json.dumps([float(x) for x in info["bbox_mm"]])
+        
+        for k, v in anom_cols.items():
+            row[k] = v
 
         if status != "Success":
             row["error"] = last_error or ""
@@ -1016,7 +1128,7 @@ def make_default_cfg() -> FullConfig:
 
     cfg = FullConfig()
 
-    cfg.model.backbone_type = "vit_2d"   # "vit_2d" | "resnet3d_medicalnet" | "cnn3d_custom"
+    cfg.model.backbone_type = "vit_2d"   # "vit_2d" 
     cfg.inp.use_25d = True
     cfg.inp.k_25d = 5
     cfg.prep.windows = [(-600,1500), (40,400)]
@@ -1024,6 +1136,13 @@ def make_default_cfg() -> FullConfig:
     cfg.model.num_classes = 1
 
     return cfg
+
+def _topk_mean(v: np.ndarray, frac: float = 0.1, k_min: int = 5) -> float:
+    Z = v.shape[0]
+    k = max(k_min, int(np.ceil(frac * Z)))
+    k = min(k, Z)
+    idx = np.argpartition(v, -k)[-k:]
+    return float(np.mean(v[idx]))
 
 def _read_series_headers(dicom_dir):
     """Читает только заголовки, группирует по SeriesInstanceUID."""
@@ -1427,7 +1546,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     profile = 'fast_debug'
     thr = 0.55
-    input_path = r"" # путь к zip-архиву
+    input_path = r""
 
     temp_dir = None
     work_root = input_path
